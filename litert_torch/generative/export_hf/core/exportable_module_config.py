@@ -14,10 +14,17 @@
 # ==============================================================================
 """Exportable modules."""
 
+from collections.abc import Callable, Sequence
 import dataclasses
 import difflib
 import enum
+import hashlib
+import importlib
+from importlib import util as importlib_util
+import os
 import pprint
+import sys
+import types
 from typing import Any
 import warnings
 
@@ -43,7 +50,6 @@ _KNOWN_EXTRA_KWARGS = frozenset({
     "audio_include_mask_inputs",
     "audio_mel_frames",
     "audio_num_layers",
-    "gemma4_vision_max_soft_tokens",
     "litert_samples_conversion_dir",
     "llm_intermediate_size",
     "llm_num_layers",
@@ -58,6 +64,149 @@ _DEPRECATED_EXTRA_KWARGS = frozenset({
     "use_sdpa_composite",
     "use_sdpa_composite_for_prefill",
 })
+
+# Additional `extra_kwargs` flag names declared by registered `ModelExtension`s.
+_REGISTERED_EXTRA_KWARGS: set[str] = set()
+_EXTENSION_MODULE_LOADER: Callable[[Sequence[str]], None] | None = None
+_ENTRY_POINT_LOADER: Callable[[], None] | None = None
+
+
+def register_extra_kwargs_keys(keys: Sequence[str]) -> None:
+  """Registers extra CLI / `extra_kwargs` keys declared by a `ModelExtension`.
+
+  Called when a `ModelExtension` with `extra_kwargs_keys` is registered (see
+  `model_ext/gemma4/extension.py` for an example) so `ExportableModuleConfig`
+  accepts those flags without raising an unknown-argument `ValueError`.
+
+  Args:
+    keys: Sequence of flag names to allow in `ExportableModuleConfig`.
+  """
+  for key in keys:
+    if key:
+      _REGISTERED_EXTRA_KWARGS.add(key)
+
+
+def get_registered_extra_kwargs() -> frozenset[str]:
+  """Returns the `extra_kwargs` flag names registered by `ModelExtension`s."""
+  return frozenset(_REGISTERED_EXTRA_KWARGS)
+
+
+def reset_registered_extra_kwargs(keys: Sequence[str] = ()) -> None:
+  """Replaces dynamically registered `extra_kwargs` keys with `keys`.
+
+  Used when unregistering a `ModelExtension` or resetting state between tests.
+
+  Args:
+    keys: Replacement sequence of allowed `extra_kwargs` flag names.
+  """
+  _REGISTERED_EXTRA_KWARGS.clear()
+  _REGISTERED_EXTRA_KWARGS.update(k for k in keys if k)
+
+
+def set_extension_loader_hooks(
+    module_loader: Callable[[Sequence[str]], None] | None = None,
+    entry_point_loader: Callable[[], None] | None = None,
+) -> None:
+  """Wires `model_ext.extension` loader callbacks without circular imports.
+
+  `core/exportable_module_config.py` sits below `model_ext` in the dependency
+  graph. `model_ext/extension.py` registers its module and entry-point loaders
+  here at import time.
+
+  Args:
+    module_loader: Callback that imports `--extension_modules` entries.
+    entry_point_loader: Callback that discovers `importlib.metadata` plugins.
+  """
+  global _EXTENSION_MODULE_LOADER, _ENTRY_POINT_LOADER
+  if module_loader is not None:
+    _EXTENSION_MODULE_LOADER = module_loader
+  if entry_point_loader is not None:
+    _ENTRY_POINT_LOADER = entry_point_loader
+
+
+def is_extension_file_path(spec: str) -> bool:
+  """Returns True if `spec` is a filesystem `.py` path rather than module name.
+
+  Args:
+    spec: Single entry from `extension_modules` (e.g. `'./my_ext.py'` or
+      `'my_pkg.my_ext'`).
+
+  Returns:
+    True when `spec` should be loaded via `load_extension_file` instead of
+    `importlib.import_module`.
+  """
+  if not spec:
+    return False
+  if spec.endswith(".py") or spec.startswith((".", "~")):
+    return True
+  if os.sep in spec or (os.altsep and os.altsep in spec):
+    return True
+  return os.path.isfile(os.path.expanduser(spec))
+
+
+def load_extension_file(file_path: str) -> types.ModuleType:
+  """Loads a standalone Python extension `.py` file idempotently by path.
+
+  Assigns a deterministic synthetic module name derived from the canonical
+  absolute path so repeated calls return the cached module in `sys.modules`
+  without re-executing top-level registration side effects.
+
+  Args:
+    file_path: Relative, `~`-prefixed, or absolute path to an extension `.py`
+      file.
+
+  Returns:
+    The imported `types.ModuleType` object.
+
+  Raises:
+    FileNotFoundError: If `file_path` does not exist on disk.
+    ImportError: If `importlib` cannot construct a module spec for `file_path`.
+  """
+  abs_path = os.path.abspath(os.path.expanduser(file_path))
+  if not os.path.isfile(abs_path):
+    raise FileNotFoundError(
+        f"Extension module file not found: {file_path!r} (resolved to"
+        f" {abs_path!r})."
+    )
+  stem = os.path.splitext(os.path.basename(abs_path))[0]
+  safe_stem = "".join(
+      ch if ch.isidentifier() or ch.isdigit() else "_" for ch in stem
+  )
+  safe_stem = safe_stem or "ext"
+  digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:12]
+  mod_name = f"_litert_torch_ext_file_{safe_stem}_{digest}"
+  existing = sys.modules.get(mod_name)
+  if existing is not None:
+    return existing
+
+  spec = importlib_util.spec_from_file_location(mod_name, abs_path)
+  if spec is None or spec.loader is None:
+    raise ImportError(
+        f"Could not create module spec from extension file: {abs_path!r}."
+    )
+  module = importlib_util.module_from_spec(spec)
+  sys.modules[mod_name] = module
+  try:
+    spec.loader.exec_module(module)
+  except Exception:
+    sys.modules.pop(mod_name, None)
+    raise
+  return module
+
+
+def _default_load_extension_modules(modules: Sequence[str]) -> None:
+  """Loads dotted module paths or `.py` files when `model_ext` isn't loaded."""
+  for module_spec in modules:
+    if not module_spec:
+      continue
+    if is_extension_file_path(module_spec):
+      mod = load_extension_file(module_spec)
+    else:
+      mod = importlib.import_module(module_spec)
+    for obj in vars(mod).values():
+      extra_keys = getattr(obj, "extra_kwargs_keys", ())
+      if isinstance(extra_keys, (list, tuple, set, frozenset)):
+        register_extra_kwargs_keys(tuple(extra_keys))
 
 
 # GPU composite and fusion flags that default to `True` when
@@ -229,8 +378,9 @@ class ExportableModuleConfig:
   # Optional `ModelExtension` subclass/instance (or sequence of extensions)
   # layered over any registered extension for the target `model_type`.
   model_extension: Any = None
-  # Optional dotted Python module path(s) imported before model loading so
-  # `@register_model_extension` / `@register_patch` decorators execute.
+  # Optional dotted Python module path(s) or `.py` file path(s) imported before
+  # model loading so `@register_model_extension` / `@register_patch` decorators
+  # execute.
   extension_modules: list[str] | tuple[str, ...] | str | None = None
 
   extra_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -305,6 +455,37 @@ class ExportableModuleConfig:
     self.extra_kwargs["apply_gpu_composites"] = self.apply_gpu_composites
     self.extra_kwargs["use_bool_mask"] = self.use_bool_mask
 
+  def _collect_model_extension_extra_kwargs(self) -> set[str]:
+    """Collects `extra_kwargs_keys` declared on `self.model_extension`."""
+    collected: set[str] = set()
+
+    def _visit(ext: Any) -> None:
+      if ext is None:
+        return
+      if isinstance(ext, (list, tuple)):
+        for item in ext:
+          _visit(item)
+        return
+      nested = getattr(ext, "extensions", None)
+      if isinstance(nested, (list, tuple)):
+        for item in nested:
+          _visit(item)
+      extra_keys = getattr(ext, "extra_kwargs_keys", ())
+      if isinstance(extra_keys, (list, tuple, set, frozenset)):
+        collected.update(k for k in extra_keys if k)
+
+    _visit(self.model_extension)
+    return collected
+
+  def _known_extra_kwargs(self) -> set[str]:
+    return (
+        set(_KNOWN_EXTRA_KWARGS)
+        | set(_DEPRECATED_EXTRA_KWARGS)
+        | _REGISTERED_EXTRA_KWARGS
+        | self._collect_model_extension_extra_kwargs()
+        | {f.name for f in dataclasses.fields(self)}
+    )
+
   def _validate_extra_kwargs(self):
     """Rejects unrecognized `extra_kwargs` keys.
 
@@ -312,12 +493,19 @@ class ExportableModuleConfig:
     so without this check a mistyped flag is silently ignored and the model is
     exported without the requested optimization.
     """
-    known = (
-        _KNOWN_EXTRA_KWARGS
-        | _DEPRECATED_EXTRA_KWARGS
-        | {f.name for f in dataclasses.fields(self)}
-    )
+    known = self._known_extra_kwargs()
     unknown = sorted(set(self.extra_kwargs) - known)
+    if unknown:
+      try:
+        importlib.import_module(
+            "litert_torch.generative.export_hf.model_ext.builtin_extensions"
+        )
+      except ImportError:
+        pass
+      if _ENTRY_POINT_LOADER is not None:
+        _ENTRY_POINT_LOADER()
+      known = self._known_extra_kwargs()
+      unknown = sorted(set(self.extra_kwargs) - known)
     if not unknown:
       return
     details = []
@@ -333,6 +521,17 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    if isinstance(self.extension_modules, str):
+      self.extension_modules = [
+          x.strip() for x in self.extension_modules.split(",") if x.strip()
+      ]
+    elif isinstance(self.extension_modules, tuple):
+      self.extension_modules = list(self.extension_modules)
+
+    if self.extension_modules:
+      loader = _EXTENSION_MODULE_LOADER or _default_load_extension_modules
+      loader(self.extension_modules)
+
     self._validate_extra_kwargs()
     self._normalize_sdpa_composite()
     if self.prefill_logits is None:
@@ -369,13 +568,6 @@ class ExportableModuleConfig:
 
     if not self.cache_lengths:
       self.cache_lengths = [self.cache_length]
-
-    if isinstance(self.extension_modules, str):
-      self.extension_modules = [
-          x.strip() for x in self.extension_modules.split(",") if x.strip()
-      ]
-    elif isinstance(self.extension_modules, tuple):
-      self.extension_modules = list(self.extension_modules)
 
     if self.enable_dynamic_shape and len(self.cache_lengths) > 1:
       raise ValueError(

@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for SDPA composite normalization, GPU optimizations, and extra_kwargs validation."""
 
+import os
 from unittest import mock
 import warnings
 
@@ -182,6 +183,44 @@ class ExtraKwargsValidationTest(parameterized.TestCase):
     )
     self.assertEqual(config.t2i_output_image_size, 256)
     self.assertEqual(config.extra_kwargs["max_seq_len"], 128)
+
+  def test_inline_model_extension_declares_extra_kwargs_keys(self):
+    class _InlineExt:
+      extra_kwargs_keys = ("custom_ext_knob",)
+
+    config = _config(
+        model_extension=_InlineExt(),
+        extra_kwargs={"custom_ext_knob": 42},
+    )
+    self.assertEqual(config.extra_kwargs["custom_ext_knob"], 42)
+    with self.assertRaisesRegex(ValueError, "Unrecognized export flag"):
+      _config(
+          model_extension=_InlineExt(),
+          extra_kwargs={"undeclared_ext_knob": 42},
+      )
+
+  def test_standalone_extension_file_registers_extra_kwargs_before_validation(
+      self,
+  ):
+    saved = exportable_module_config.get_registered_extra_kwargs()
+    try:
+      ext_path = os.path.join(
+          self.create_tempdir().full_path, "standalone_custom_ext.py"
+      )
+      with open(ext_path, "w") as f:
+        f.write(
+            "class StandaloneExt:\n"
+            "  model_types = ('standalone_arch',)\n"
+            "  extra_kwargs_keys = ('standalone_arch_flag',)\n"
+        )
+      config = _config(
+          extension_modules=ext_path,
+          extra_kwargs={"standalone_arch_flag": "enabled"},
+      )
+      self.assertEqual(config.extension_modules, [ext_path])
+      self.assertEqual(config.extra_kwargs["standalone_arch_flag"], "enabled")
+    finally:
+      exportable_module_config.reset_registered_extra_kwargs(saved)
 
 
 class ModelDtypeTest(parameterized.TestCase):

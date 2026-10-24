@@ -98,7 +98,7 @@ def verify_model_compatibility(model, model_config, text_model_config):
   """Verifies model compatibility."""
   # Validating compatibility...
   # NOTE: Currently we don't throw errors for model incompatibilities.
-  rope_type = getattr(text_model_config, 'rope_type', 'default')
+  rope_type = getattr(text_model_config, 'rope_type', None) or 'default'
   if 'dynamic' in rope_type or 'longrope' in rope_type:
     print(utils.ERROR_MESSAGE)
     print('Dynamic and longrope are not supported yet.')
@@ -319,6 +319,180 @@ def _load_tts_config(
   return transformers.PretrainedConfig.from_dict(config_dict)
 
 
+def _load_hf_config(
+    model_path: str,
+    export_config: exportable_module.ExportableModuleConfig,
+    trust_remote_code: bool,
+    task: ExportTask | str,
+) -> transformers.PretrainedConfig:
+  """Loads `PretrainedConfig`, consulting any active `ModelExtension` first.
+
+  Enters the resolved extension's `patch_context()`, gives
+  `ModelExtension.load_config` first chance to construct the config, and falls
+  back to `transformers.AutoConfig.from_pretrained` (or raw `config.json` +
+  `infer_model_type_from_extensions` for out-of-tree architectures not built
+  into `transformers`).
+
+  Args:
+    model_path: Local checkpoint directory or HuggingFace repo ID.
+    export_config: Active `ExportableModuleConfig`.
+    trust_remote_code: Whether remote code execution is enabled.
+    task: Active export task enum or string.
+
+  Returns:
+    Loaded `transformers.PretrainedConfig` instance.
+  """
+  try:
+    config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+        model_path, trust_remote_code=trust_remote_code
+    )
+  except Exception:  # pylint: disable=broad-exception-caught
+    config_dict = {}
+
+  model_type = export_config.litert_lm_model_type_override or config_dict.get(
+      'model_type'
+  )
+  if not model_type:
+    model_type = model_ext_extension.infer_model_type_from_extensions(
+        model_path=model_path,
+        task=task,
+        config_dict=config_dict or None,
+        export_config=export_config,
+    )
+
+  ext = model_ext_extension.resolve_model_extension(model_type, export_config)
+  patch_cm = (
+      model_ext_patches.get_patch_context(model_type or '', export_config)
+      if (model_type or ext is not None)
+      else contextlib.nullcontext()
+  )
+  with patch_cm:
+    if ext is not None:
+      custom_cfg = ext.load_config(
+          model_path, export_config, trust_remote_code=trust_remote_code
+      )
+      if custom_cfg is not None:
+        return custom_cfg
+    try:
+      return transformers.AutoConfig.from_pretrained(
+          model_path,
+          dtype=torch.float32,
+          trust_remote_code=trust_remote_code,
+      )
+    except (KeyError, ValueError):
+      if not config_dict:
+        config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+            model_path, trust_remote_code=trust_remote_code
+        )
+      if model_type and 'model_type' not in config_dict:
+        config_dict['model_type'] = model_type
+      return transformers.PretrainedConfig.from_dict(config_dict)
+
+
+def _load_tokenizer(model_path: str, trust_remote_code: bool) -> Any:
+  """Loads an HF tokenizer, falling back to `tokenizer.json` for custom archs."""
+  try:
+    return transformers.AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
+  except Exception:  # pylint: disable=broad-exception-caught
+    tokenizer_json = (
+        os.path.join(model_path, 'tokenizer.json')
+        if os.path.isdir(model_path)
+        else ''
+    )
+    if not tokenizer_json or not os.path.exists(tokenizer_json):
+      raise
+    return transformers.PreTrainedTokenizerFast(tokenizer_file=tokenizer_json)
+
+
+def _instantiate_hf_model_from_config(
+    model_cls: Any,
+    config: Any,
+    model_dtype: torch.dtype,
+    trust_remote_code: bool,
+) -> Any:
+  """Instantiates an `AutoModel*`, `PreTrainedModel`, or plain `nn.Module`.
+
+  Supports all three class shapes returned by `ModelExtension.get_hf_model_cls`
+  or `transformers.AutoModelFor*` when constructing a model from `config`
+  without `from_pretrained` (for example on the meta device under `use_v2=True`
+  or before loading weights manually).
+
+  Args:
+    model_cls: Model factory or `nn.Module` subclass.
+    config: Loaded `PretrainedConfig`.
+    model_dtype: Target parameter `torch.dtype`.
+    trust_remote_code: Passed to `model_cls.from_config` when supported.
+
+  Returns:
+    Instantiated PyTorch model.
+  """
+  if hasattr(model_cls, 'from_config'):
+    return model_cls.from_config(
+        config=config,
+        torch_dtype=model_dtype,
+        trust_remote_code=trust_remote_code,
+    )
+  if hasattr(model_cls, '_from_config'):
+    return model_cls._from_config(config, torch_dtype=model_dtype)  # pylint: disable=protected-access
+  return model_cls(config)
+
+
+def _build_checkpoint_weights_loader(
+    model_path: str,
+    model: nn.Module,
+    resolved_ext: model_ext_extension.ModelExtension | None,
+) -> weights_loader_lib.HFCheckpointWeightsLoader:
+  """Builds an `HFCheckpointWeightsLoader` wired to `ModelExtension` hooks.
+
+  Detects tied input/output embeddings on `model` and forwards
+  `checkpoint_key_prefixes`, `fused_weight_specs`, and
+  `resolve_checkpoint_tensor` from `resolved_ext` (when present).
+
+  Args:
+    model_path: Local checkpoint directory or HuggingFace repo ID.
+    model: Meta-device model instance being exported.
+    resolved_ext: Active `ModelExtension` for `model`, or `None`.
+
+  Returns:
+    Configured `HFCheckpointWeightsLoader` instance.
+  """
+  input_emb = (
+      model.get_input_embeddings()
+      if hasattr(model, 'get_input_embeddings')
+      else None
+  )
+  output_emb = (
+      model.get_output_embeddings()
+      if hasattr(model, 'get_output_embeddings')
+      else None
+  )
+  return weights_loader_lib.HFCheckpointWeightsLoader(
+      model_path,
+      tie_word_embeddings=(
+          input_emb is not None
+          and output_emb is not None
+          and getattr(output_emb, 'weight', None)
+          is getattr(input_emb, 'weight', None)
+          and getattr(input_emb, 'weight', None) is not None
+      ),
+      extra_prefixes=(
+          resolved_ext.checkpoint_key_prefixes
+          if resolved_ext is not None
+          else ()
+      ),
+      extra_fused_specs=(
+          resolved_ext.fused_weight_specs if resolved_ext is not None else ()
+      ),
+      tensor_resolver=(
+          resolved_ext.resolve_checkpoint_tensor
+          if resolved_ext is not None
+          else None
+      ),
+  )
+
+
 @progress.task('Load source model')
 def load_model(
     model_path: str,
@@ -423,17 +597,7 @@ def load_model(
     else:
       model_cls = model_ext_exportables.get_any2any_model_cls(model_type)
     model = model_cls(local_model_dir, export_config=export_config)
-    try:
-      tokenizer = transformers.AutoTokenizer.from_pretrained(
-          model.model_dir, trust_remote_code=trust_remote_code
-      )
-    except Exception:  # pylint: disable=broad-exception-caught
-      tokenizer_json = os.path.join(model.model_dir, 'tokenizer.json')
-      if not os.path.exists(tokenizer_json):
-        raise
-      tokenizer = transformers.PreTrainedTokenizerFast(
-          tokenizer_file=tokenizer_json
-      )
+    tokenizer = _load_tokenizer(model.model_dir, trust_remote_code)
     config = transformers.PretrainedConfig.from_dict({'model_type': model_type})
     return SourceModelArtifacts(
         model=model,
@@ -461,19 +625,12 @@ def load_model(
         tokenizer=tokenizer,  # pyrefly: ignore[bad-argument-type]
     )
 
-  try:
-    config = transformers.AutoConfig.from_pretrained(
-        model_path,
-        dtype=torch.float32,
-        trust_remote_code=trust_remote_code,
-    )
-  except (KeyError, ValueError):
-    # Fallback to PretrainedConfig if the model architecture is not built into
-    # transformers AutoConfig.
-    config_dict, _ = transformers.PretrainedConfig.get_config_dict(
-        model_path, trust_remote_code=trust_remote_code
-    )
-    config = transformers.PretrainedConfig.from_dict(config_dict)
+  config = _load_hf_config(
+      model_path,
+      export_config,
+      trust_remote_code=trust_remote_code,
+      task=task,
+  )
 
   # Opt-in to global access for per-layer config attributes to avoid blocking heterogeneous pipelines
   if hasattr(config, 'allow_global_per_layer_attribute_access'):
@@ -508,7 +665,19 @@ def load_model(
     if subcfg is not None and hasattr(subcfg, 'dtype'):
       subcfg.dtype = torch.float32
 
-  if task == ExportTask.TEXT_GENERATION:
+  resolved_ext = model_ext_extension.resolve_model_extension(
+      getattr(config, 'model_type', None), export_config
+  )
+  ext_model_cls = (
+      resolved_ext.get_hf_model_cls(task, config, export_config)
+      if resolved_ext is not None
+      else None
+  )
+  if auto_model_override is not None:
+    auto_model_cls = transformers.__dict__[auto_model_override]
+  elif ext_model_cls is not None:
+    auto_model_cls = ext_model_cls
+  elif task == ExportTask.TEXT_GENERATION:
     auto_model_cls = transformers.AutoModelForCausalLM
   elif task == ExportTask.IMAGE_TEXT_TO_TEXT:
     auto_model_cls = transformers.AutoModelForImageTextToText
@@ -516,28 +685,20 @@ def load_model(
     auto_model_cls = transformers.AutoModelForMultimodalLM
   else:
     raise ValueError(f'Unsupported task: {task}')
-  if auto_model_override is not None:
-    auto_model_cls = transformers.__dict__[auto_model_override]
 
   weights_loader = None
   model_dtype = export_config.get_torch_dtype()
   with model_ext_patches.get_patch_context(config.model_type, export_config):
     if export_config.use_v2 and not export_config.use_random_weights:
       with weights_loader_lib.init_params_on_meta():
-        model = auto_model_cls.from_config(
+        model = _instantiate_hf_model_from_config(
+            auto_model_cls,
             config=config,
-            torch_dtype=model_dtype,
+            model_dtype=model_dtype,
             trust_remote_code=trust_remote_code,
         )
-      input_emb = model.get_input_embeddings()
-      output_emb = model.get_output_embeddings()
-      weights_loader = weights_loader_lib.HFCheckpointWeightsLoader(
-          model_path,
-          tie_word_embeddings=(
-              input_emb is not None
-              and output_emb is not None
-              and output_emb.weight is input_emb.weight
-          ),
+      weights_loader = _build_checkpoint_weights_loader(
+          model_path, model, resolved_ext
       )
       weights_loader_lib.load_persistent_buffers_(model, weights_loader)
       # `from_config` only initializes `generation_config` from `config.json`.
@@ -549,27 +710,45 @@ def load_model(
             trust_remote_code=trust_remote_code,
         )
     elif export_config.use_random_weights:
-      model = auto_model_cls.from_config(
+      model = _instantiate_hf_model_from_config(
+          auto_model_cls,
           config=config,
-          torch_dtype=model_dtype,
+          model_dtype=model_dtype,
           trust_remote_code=trust_remote_code,
       )
     else:
-      model = auto_model_cls.from_pretrained(
-          model_path,
-          config=config,
-          torch_dtype=model_dtype,
-          trust_remote_code=trust_remote_code,
-      )
+      if hasattr(auto_model_cls, 'from_pretrained'):
+        model = auto_model_cls.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=model_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+      else:
+        model = _instantiate_hf_model_from_config(
+            auto_model_cls,
+            config=config,
+            model_dtype=model_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        ckpt_loader = _build_checkpoint_weights_loader(
+            model_path, model, resolved_ext
+        )
+        with torch.no_grad():
+          for name, param in model.named_parameters():
+            param.copy_(ckpt_loader(name).to(dtype=param.dtype))
+        weights_loader_lib.load_persistent_buffers_(model, ckpt_loader)
+        ckpt_loader.close()
     if model_dtype == torch.float32:
       model = model.to(model_dtype)
     else:
       # Keep float32 buffers (e.g. RoPE inv_freq) in float32.
       model = weights_loader_lib.cast_params_(model, model_dtype)
 
-  if task == ExportTask.TEXT_GENERATION:
-    model.generation_config.cache_implementation = 'static'
-    model.generation_config.do_sample = False
+  gen_cfg: Any = getattr(model, 'generation_config', None)
+  if task == ExportTask.TEXT_GENERATION and gen_cfg is not None:
+    gen_cfg.cache_implementation = 'static'
+    gen_cfg.do_sample = False
 
   text_model_config = config
   if hasattr(config, 'text_config'):
@@ -598,10 +777,7 @@ def load_model(
   else:
     feature_extractor = None
 
-  # TODO(weiyiw): Refactor into a separate function.
-  tokenizer = transformers.AutoTokenizer.from_pretrained(
-      model_path, trust_remote_code=trust_remote_code
-  )
+  tokenizer = _load_tokenizer(model_path, trust_remote_code)
   if not hasattr(tokenizer, 'chat_template') or not tokenizer.chat_template:
     try:
       if utils.get_model_path_type(model_path) == 'repo_id':
