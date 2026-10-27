@@ -378,16 +378,28 @@ class HFCheckpointWeightsLoader:
   `lm_head` weights are reconstructed from their checkpoint components.
   """
 
-  def __init__(self, model_path: str, tie_word_embeddings: bool = False):
+  def __init__(
+      self,
+      model_path: str,
+      tie_word_embeddings: bool = False,
+      config: Any = None,
+      export_config: Any = None,
+  ):
     """Initializes the loader.
 
     Args:
       model_path: Local checkpoint directory or HuggingFace repo id.
       tie_word_embeddings: Whether `lm_head` shares the embedding table. Only
-        then is a missing `lm_head.weight` served from the embedding table;
-        the two have the same shape, so a wrong fallback would go unnoticed.
+        then is a missing `lm_head.weight` served from the embedding table; the
+        two have the same shape, so a wrong fallback would go unnoticed.
+      config: Optional HuggingFace model config used for architecture-specific
+        weight layout adjustments.
+      export_config: Optional export configuration controlling composite weight
+        transformations.
     """
     self._tie_word_embeddings = tie_word_embeddings
+    self.config = config
+    self.export_config = export_config
     self._handles: dict[str, Any] = {}
     self._checkpoint_dir = self._resolve_checkpoint_dir(model_path)
     self._weight_map = self._load_weight_map()
@@ -447,8 +459,7 @@ class HFCheckpointWeightsLoader:
     return self._handle(path).get_tensor(key)
 
   @staticmethod
-  def _candidates(param_name: str) -> list[str]:
-    """Returns checkpoint keys `param_name` may correspond to, in order."""
+  def _strip_wrapper_prefixes(param_name: str) -> str:
     stripped = param_name
     while True:
       for prefix in _WRAPPER_PREFIXES:
@@ -457,6 +468,12 @@ class HFCheckpointWeightsLoader:
           break
       else:
         break
+    return stripped
+
+  @classmethod
+  def _candidates(cls, param_name: str) -> list[str]:
+    """Returns checkpoint keys `param_name` may correspond to, in order."""
+    stripped = cls._strip_wrapper_prefixes(param_name)
     candidates = [
         param_name,
         stripped,
@@ -467,10 +484,72 @@ class HFCheckpointWeightsLoader:
     ]
     return list(dict.fromkeys(candidates))  # Dedupe, preserving order.
 
+  def _is_qwen3_5(self) -> bool:
+    if self.config is None:
+      return False
+    model_types = {
+        getattr(self.config, "model_type", None),
+        getattr(getattr(self.config, "text_config", None), "model_type", None),
+    }
+    return bool(
+        model_types
+        & {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+    )
+
+  def _get_qwen3_5_partial_rope_perm(self) -> torch.Tensor | None:
+    """Returns the Qwen3.5 partial-rotary channel permutation for a head."""
+    if not self._is_qwen3_5():
+      return None
+    cfg = getattr(self.config, "text_config", None) or self.config
+    head_dim = getattr(cfg, "head_dim", None) or (
+        cfg.hidden_size // cfg.num_attention_heads
+    )
+    rope_params = getattr(cfg, "rope_parameters", None)
+    partial_factor = 0.25
+    if isinstance(rope_params, dict):
+      partial_factor = float(
+          rope_params.get("partial_rotary_factor", partial_factor)
+      )
+    elif rope_params is not None:
+      partial_factor = float(
+          getattr(rope_params, "partial_rotary_factor", partial_factor)
+      )
+    else:
+      partial_factor = float(
+          getattr(cfg, "partial_rotary_factor", partial_factor)
+      )
+    rotary_dim = int(head_dim * partial_factor)
+    if not (0 < rotary_dim < head_dim):
+      return None
+    half_rot = rotary_dim // 2
+    half_dim = head_dim // 2
+    first_pass_len = half_dim - half_rot
+    pass_indices = torch.arange(rotary_dim, head_dim)
+    perm = torch.empty(head_dim, dtype=torch.long)
+    perm[:half_rot] = torch.arange(half_rot)
+    perm[half_rot:half_dim] = pass_indices[:first_pass_len]
+    perm[half_dim : half_dim + half_rot] = torch.arange(half_rot, rotary_dim)
+    perm[half_dim + half_rot :] = pass_indices[first_pass_len:]
+    return perm
+
   def _try_load(self, param_name: str) -> torch.Tensor | None:
+    """Loads `param_name` if present in the checkpoint, applying norm perms."""
     for candidate in self._candidates(param_name):
       if candidate in self._weight_map:
-        return self._get(candidate)
+        tensor = self._get(candidate)
+        if (
+            self._is_qwen3_5()
+            and getattr(
+                self.export_config, "use_qkv_norm_rope_composite", False
+            )
+            and self._strip_wrapper_prefixes(param_name).endswith(
+                (".self_attn.q_norm.weight", ".self_attn.k_norm.weight")
+            )
+        ):
+          perm = self._get_qwen3_5_partial_rope_perm()
+          if perm is not None:
+            tensor = tensor[perm]
+        return tensor
     return None
 
   def _load_fused(
@@ -480,9 +559,62 @@ class HFCheckpointWeightsLoader:
     head, sep, tail = param_name.rpartition(f"{fused}.")
     if not sep or tail not in ("weight", "bias"):
       return None
-    tensors = [self._try_load(f"{head}{part}.{tail}") for part in parts]
-    if any(t is None for t in tensors):
-      return None
+    tensors: list[torch.Tensor] = []
+    for part in parts:
+      tensor = self._try_load(f"{head}{part}.{tail}")
+      if tensor is None:
+        return None
+      tensors.append(tensor)
+    if (
+        fused == "qkv_proj"
+        and len(parts) == 3
+        and self._is_qwen3_5()
+        and getattr(self.export_config, "use_qkv_norm_rope_composite", False)
+    ):
+      cfg = getattr(self.config, "text_config", None) or self.config
+      num_heads = cfg.num_attention_heads
+      num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
+      head_dim = getattr(cfg, "head_dim", None) or (
+          cfg.hidden_size // num_heads
+      )
+      q_only_size = num_heads * head_dim
+      k_size = num_kv_heads * head_dim
+      perm = self._get_qwen3_5_partial_rope_perm()
+      q_t, k_t, v_t = tensors[0], tensors[1], tensors[2]
+      if tail == "weight":
+        q_raw_w = q_t.view(num_heads, 2, head_dim, -1)
+        q_only_w = q_raw_w[:, 0, :, :].clone()
+        gate_w = q_raw_w[:, 1, :, :].reshape(q_only_size, -1)
+        k_w = k_t.view(num_kv_heads, head_dim, -1).clone()
+        if perm is not None:
+          q_only_w = q_only_w[:, perm, :]
+          k_w = k_w[:, perm, :]
+        return torch.cat(
+            [
+                q_only_w.reshape(q_only_size, -1),
+                k_w.reshape(k_size, -1),
+                v_t,
+                gate_w,
+            ],
+            dim=0,
+        )
+      else:
+        q_raw_b = q_t.view(num_heads, 2, head_dim)
+        q_only_b = q_raw_b[:, 0, :].clone()
+        gate_b = q_raw_b[:, 1, :].reshape(q_only_size)
+        k_b = k_t.view(num_kv_heads, head_dim).clone()
+        if perm is not None:
+          q_only_b = q_only_b[:, perm]
+          k_b = k_b[:, perm]
+        return torch.cat(
+            [
+                q_only_b.reshape(q_only_size),
+                k_b.reshape(k_size),
+                v_t,
+                gate_b,
+            ],
+            dim=0,
+        )
     return torch.cat(tensors, dim=0)
 
   def __call__(self, param_name: str) -> torch.Tensor:

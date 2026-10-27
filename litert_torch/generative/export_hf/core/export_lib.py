@@ -538,6 +538,8 @@ def load_model(
               and output_emb is not None
               and output_emb.weight is input_emb.weight
           ),
+          config=config,
+          export_config=export_config,
       )
       weights_loader_lib.load_persistent_buffers_(model, weights_loader)
       # `from_config` only initializes `generation_config` from `config.json`.
