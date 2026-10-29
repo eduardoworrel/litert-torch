@@ -14,7 +14,7 @@
 # ==============================================================================
 """Streaming weights loading for Converter V2 (meta-device) export."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 import contextlib
 import glob
 import json
@@ -45,6 +45,14 @@ _EMBEDDING_KEYS = (
     "embed_tokens.weight",
     "model.language_model.embed_tokens.weight",
     "transformer.wte.weight",
+)
+# Built-in fused linear specs `(fused_name, part_names, dim)`. Gemma-4 global
+# attention layers with `attention_k_eq_v=True` omit `v_proj`, so `qkv_proj` has
+# both 3-way and 2-way entries.
+_DEFAULT_FUSED_SPECS: tuple[tuple[str, tuple[str, ...], int], ...] = (
+    ("qkv_proj", ("q_proj", "k_proj", "v_proj"), 0),
+    ("qkv_proj", ("q_proj", "k_proj"), 0),
+    ("gate_up_proj", ("gate_proj", "up_proj"), 0),
 )
 
 
@@ -372,22 +380,75 @@ def _has_all_weights(checkpoint_dir: str) -> bool:
 class HFCheckpointWeightsLoader:
   """Streams weights on demand from a HuggingFace safetensors checkpoint.
 
-  Parameter names of the export-time module are matched against checkpoint
-  keys after stripping common wrapper prefixes. Fused QKV / gate-up
-  projections created by `fuse_qkv` / `fuse_gate_up` patches and tied
-  `lm_head` weights are reconstructed from their checkpoint components.
+  Used by Converter V2 (`use_v2=True` with `delete_in_memory_params=True`) so
+  large checkpoints can be traced on the `meta` device and materialized one
+  tensor at a time during serialization. Parameter names of the export-time
+  module are matched against checkpoint keys after stripping standard wrapper
+  prefixes (`model.`, `language_model.`, ...) plus any `extra_prefixes` from an
+  active `ModelExtension`.
+
+  Resolution order in `__call__(param_name)`:
+  1. Direct safetensors lookup across `_candidates(param_name)`.
+  2. Custom `tensor_resolver(param_name, try_load)` hook from
+     `ModelExtension.resolve_checkpoint_tensor` (if provided).
+  3. Extension-declared `extra_fused_specs`
+     (`ModelExtension.fused_weight_specs`) followed by built-in `qkv_proj` and
+     `gate_up_proj` fusions.
+  4. Tied `lm_head.weight` -> input embedding weight fallback when
+     `tie_word_embeddings=True`.
   """
 
-  def __init__(self, model_path: str, tie_word_embeddings: bool = False):
-    """Initializes the loader.
+  def __init__(
+      self,
+      model_path: str,
+      tie_word_embeddings: bool = False,
+      extra_prefixes: Sequence[str] = (),
+      extra_fused_specs: Sequence[
+          tuple[str, Sequence[str]] | tuple[str, Sequence[str], int] | Any
+      ] = (),
+      tensor_resolver: (
+          Callable[
+              [str, Callable[[str], torch.Tensor | None]], torch.Tensor | None
+          ]
+          | None
+      ) = None,
+      config: Any = None,
+      export_config: Any = None,
+  ):
+    """Initializes the safetensors checkpoint weight loader.
 
     Args:
       model_path: Local checkpoint directory or HuggingFace repo id.
       tie_word_embeddings: Whether `lm_head` shares the embedding table. Only
         then is a missing `lm_head.weight` served from the embedding table;
         the two have the same shape, so a wrong fallback would go unnoticed.
+      extra_prefixes: Additional checkpoint/module prefixes (e.g.
+        `('backbone.', 'decoder.')`) from
+        `ModelExtension.checkpoint_key_prefixes`.
+      extra_fused_specs: Additional `FusedWeightSpec` entries or
+        `(fused_name, part_names[, dim])` tuples from
+        `ModelExtension.fused_weight_specs` for reconstructing fused projections
+        from unfused checkpoint tensors.
+      tensor_resolver: Optional `(param_name, try_load) -> Tensor | None`
+        callback from `ModelExtension.resolve_checkpoint_tensor` for custom
+        slicing, transposition, or key remapping.
+      config: Optional HuggingFace model config used for architecture-specific
+        weight layout adjustments.
+      export_config: Optional export configuration controlling composite weight
+        transformations.
     """
     self._tie_word_embeddings = tie_word_embeddings
+    self._extra_prefixes = tuple(
+        p if p.endswith(".") else f"{p}." for p in extra_prefixes if p
+    )
+    normalized_extra = tuple(
+        (spec[0], tuple(spec[1]), int(spec[2]) if len(spec) > 2 else 0)
+        for spec in extra_fused_specs
+    )
+    self._fused_specs = (*normalized_extra, *_DEFAULT_FUSED_SPECS)
+    self._tensor_resolver = tensor_resolver
+    self.config = config
+    self.export_config = export_config
     self._handles: dict[str, Any] = {}
     self._checkpoint_dir = self._resolve_checkpoint_dir(model_path)
     self._weight_map = self._load_weight_map()
@@ -447,16 +508,24 @@ class HFCheckpointWeightsLoader:
     return self._handle(path).get_tensor(key)
 
   @staticmethod
-  def _candidates(param_name: str) -> list[str]:
-    """Returns checkpoint keys `param_name` may correspond to, in order."""
+  def _strip_prefixes(param_name: str, prefixes: Sequence[str]) -> str:
+    """Repeatedly strips leading `prefixes` from `param_name`."""
     stripped = param_name
     while True:
-      for prefix in _WRAPPER_PREFIXES:
+      for prefix in prefixes:
         if stripped.startswith(prefix):
           stripped = stripped.removeprefix(prefix)
           break
       else:
         break
+    return stripped
+
+  @staticmethod
+  def _candidates(param_name: str) -> list[str]:
+    """Returns checkpoint keys `param_name` may correspond to, in order."""
+    stripped = HFCheckpointWeightsLoader._strip_prefixes(
+        param_name, _WRAPPER_PREFIXES
+    )
     candidates = [
         param_name,
         stripped,
@@ -467,47 +536,187 @@ class HFCheckpointWeightsLoader:
     ]
     return list(dict.fromkeys(candidates))  # Dedupe, preserving order.
 
+  def _is_qwen3_5(self) -> bool:
+    if self.config is None:
+      return False
+    model_types = {
+        getattr(self.config, "model_type", None),
+        getattr(getattr(self.config, "text_config", None), "model_type", None),
+    }
+    return bool(
+        model_types
+        & {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+    )
+
+  def _get_qwen3_5_partial_rope_perm(self) -> torch.Tensor | None:
+    """Returns the Qwen3.5 partial-rotary channel permutation for a head."""
+    if not self._is_qwen3_5():
+      return None
+    cfg = getattr(self.config, "text_config", None) or self.config
+    head_dim = getattr(cfg, "head_dim", None) or (
+        cfg.hidden_size // cfg.num_attention_heads
+    )
+    rope_params = getattr(cfg, "rope_parameters", None)
+    partial_factor = 0.25
+    if isinstance(rope_params, dict):
+      partial_factor = float(
+          rope_params.get("partial_rotary_factor", partial_factor)
+      )
+    elif rope_params is not None:
+      partial_factor = float(
+          getattr(rope_params, "partial_rotary_factor", partial_factor)
+      )
+    else:
+      partial_factor = float(
+          getattr(cfg, "partial_rotary_factor", partial_factor)
+      )
+    rotary_dim = int(head_dim * partial_factor)
+    if not (0 < rotary_dim < head_dim):
+      return None
+    half_rot = rotary_dim // 2
+    half_dim = head_dim // 2
+    first_pass_len = half_dim - half_rot
+    pass_indices = torch.arange(rotary_dim, head_dim)
+    perm = torch.empty(head_dim, dtype=torch.long)
+    perm[:half_rot] = torch.arange(half_rot)
+    perm[half_rot:half_dim] = pass_indices[:first_pass_len]
+    perm[half_dim : half_dim + half_rot] = torch.arange(half_rot, rotary_dim)
+    perm[half_dim + half_rot :] = pass_indices[first_pass_len:]
+    return perm
+
   def _try_load(self, param_name: str) -> torch.Tensor | None:
-    for candidate in self._candidates(param_name):
+    """Returns the checkpoint tensor matching `param_name`, or `None`.
+
+    For Qwen3.5 with `use_qkv_norm_rope_composite`, `q_norm` / `k_norm` weights
+    get the partial-rotary channel permutation used by `odml.qkv_norm_rope`.
+
+    Args:
+      param_name: Export-time parameter name to look up.
+
+    Returns:
+      The (possibly permuted) checkpoint tensor, or `None` if no candidate key
+      is in the checkpoint.
+    """
+    candidates = self._candidates(param_name)
+    if self._extra_prefixes:
+      stripped = self._strip_prefixes(
+          param_name, (*_WRAPPER_PREFIXES, *self._extra_prefixes)
+      )
+      candidates = list(
+          dict.fromkeys([
+              param_name,
+              stripped,
+              *(f"{prefix}{stripped}" for prefix in self._extra_prefixes),
+              *self._candidates(stripped),
+          ])
+      )
+    for candidate in candidates:
       if candidate in self._weight_map:
-        return self._get(candidate)
+        tensor = self._get(candidate)
+        if (
+            self._is_qwen3_5()
+            and getattr(
+                self.export_config, "use_qkv_norm_rope_composite", False
+            )
+            and self._strip_prefixes(param_name, _WRAPPER_PREFIXES).endswith(
+                (".self_attn.q_norm.weight", ".self_attn.k_norm.weight")
+            )
+        ):
+          perm = self._get_qwen3_5_partial_rope_perm()
+          if perm is not None:
+            tensor = tensor[perm]
+        return tensor
     return None
 
   def _load_fused(
-      self, param_name: str, fused: str, parts: tuple[str, ...]
+      self,
+      param_name: str,
+      fused: str,
+      parts: tuple[str, ...],
+      dim: int = 0,
   ) -> torch.Tensor | None:
-    """Concatenates `parts` along dim 0 if `param_name` is a fused projection."""
+    """Concatenates `parts` along `dim` if `param_name` is a fused projection."""
     head, sep, tail = param_name.rpartition(f"{fused}.")
     if not sep or tail not in ("weight", "bias"):
       return None
-    tensors = [self._try_load(f"{head}{part}.{tail}") for part in parts]
-    if any(t is None for t in tensors):
-      return None
-    return torch.cat(tensors, dim=0)
+    tensors: list[torch.Tensor] = []
+    for part in parts:
+      tensor = self._try_load(f"{head}{part}.{tail}")
+      if tensor is None:
+        return None
+      tensors.append(tensor)
+    if (
+        fused == "qkv_proj"
+        and len(parts) == 3
+        and dim == 0
+        and self._is_qwen3_5()
+        and getattr(self.export_config, "use_qkv_norm_rope_composite", False)
+    ):
+      cfg = getattr(self.config, "text_config", None) or self.config
+      num_heads = cfg.num_attention_heads
+      num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
+      head_dim = getattr(cfg, "head_dim", None) or (
+          cfg.hidden_size // num_heads
+      )
+      q_only_size = num_heads * head_dim
+      k_size = num_kv_heads * head_dim
+      perm = self._get_qwen3_5_partial_rope_perm()
+      q_t, k_t, v_t = tensors[0], tensors[1], tensors[2]
+      if tail == "weight":
+        q_raw_w = q_t.view(num_heads, 2, head_dim, -1)
+        q_only_w = q_raw_w[:, 0, :, :].clone()
+        gate_w = q_raw_w[:, 1, :, :].reshape(q_only_size, -1)
+        k_w = k_t.view(num_kv_heads, head_dim, -1).clone()
+        if perm is not None:
+          q_only_w = q_only_w[:, perm, :]
+          k_w = k_w[:, perm, :]
+        return torch.cat(
+            [
+                q_only_w.reshape(q_only_size, -1),
+                k_w.reshape(k_size, -1),
+                v_t,
+                gate_w,
+            ],
+            dim=0,
+        )
+      else:
+        q_raw_b = q_t.view(num_heads, 2, head_dim)
+        q_only_b = q_raw_b[:, 0, :].clone()
+        gate_b = q_raw_b[:, 1, :].reshape(q_only_size)
+        k_b = k_t.view(num_kv_heads, head_dim).clone()
+        if perm is not None:
+          q_only_b = q_only_b[:, perm]
+          k_b = k_b[:, perm]
+        return torch.cat(
+            [
+                q_only_b.reshape(q_only_size),
+                k_b.reshape(k_size),
+                v_t,
+                gate_b,
+            ],
+            dim=0,
+        )
+    return torch.cat(tensors, dim=dim)
 
   def __call__(self, param_name: str) -> torch.Tensor:
     tensor = self._try_load(param_name)
+    if tensor is None and self._tensor_resolver is not None:
+      tensor = self._tensor_resolver(param_name, self._try_load)
     if tensor is None:
-      tensor = self._load_fused(
-          param_name, "qkv_proj", ("q_proj", "k_proj", "v_proj")
-      )
-    if tensor is None:
-      # Gemma-4 global attention layers with `attention_k_eq_v=True` have no
-      # `v_proj`, so `qkv_proj` only fuses `q_proj` and `k_proj`.
-      tensor = self._load_fused(param_name, "qkv_proj", ("q_proj", "k_proj"))
-    if tensor is None:
-      tensor = self._load_fused(
-          param_name, "gate_up_proj", ("gate_proj", "up_proj")
-      )
+      for fused_name, part_names, dim in self._fused_specs:
+        tensor = self._load_fused(param_name, fused_name, part_names, dim=dim)
+        if tensor is not None:
+          break
     if (
         tensor is None
         and self._tie_word_embeddings
         and param_name.endswith("lm_head.weight")
     ):
       # Tied word embeddings: the checkpoint only stores the embedding table.
-      key = next((k for k in _EMBEDDING_KEYS if k in self._weight_map), None)
-      if key is not None:
-        tensor = self._get(key)
+      for emb_key in (*_EMBEDDING_KEYS, "wte.weight"):
+        tensor = self._try_load(emb_key)
+        if tensor is not None:
+          break
     if tensor is None:
       raise KeyError(
           f"'{param_name}' not found in checkpoint {self._checkpoint_dir}."
@@ -517,3 +726,10 @@ class HFCheckpointWeightsLoader:
   def close(self) -> None:
     """Releases open safetensors handles; they are reopened on demand."""
     self._handles.clear()
+
+  def __enter__(self) -> "HFCheckpointWeightsLoader":
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    del exc_type, exc_val, exc_tb
+    self.close()
